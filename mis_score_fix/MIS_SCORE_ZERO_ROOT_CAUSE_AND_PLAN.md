@@ -168,8 +168,16 @@ const d1 = d1TotalWithPrevious > 0
          : 0;
 ```
 
-Apply the identical change to **D2** (`:6824`) and **FMS** (`:6919`). PMS already guards on the
-denominator only (`:6884`) — verify it matches this pattern.
+Apply the identical change to **D2** (`:6824`) and **FMS** (`:6919`) — **and to the duplicate copies in
+`calculateWeekMISScore`** (D1 `:6554`, D2 `:6605`, FMS `:6678`), which powers the trend bars. There are
+**6 guards total across 2 functions**; fixing only `calculateMISScore` leaves the trend bars showing the
+old values → a new headline-vs-trend mismatch (see §12, Caveat 1).
+
+> ⚠️ **PMS is different — do NOT apply this same edit.** PMS has **no** `EffectiveTotal===0` guard. Its
+> gap is the opposite: PMS "remaining" is scoped to `end_date { $gte, $lte }` (`:6871`) with **no
+> open-carryover bucket**, while the drilldown counts open PMS by `end_date { $lte: toDate }` (`:2118`,
+> no lower bound). To align PMS you must **ADD** an open-carryover bucket (open PMS with `end_date <
+> startDate`), not remove a guard. See §12, Caveat 2.
 
 **(b) Broaden the membership window to match the drilldown** so in-period completions of past-deadline
 tasks are counted. Options, in order of preference:
@@ -277,6 +285,70 @@ Required before merge:
 2. Should the **cron PDF report** be unified onto the same rule, or intentionally remain deadline/completion-date based?
 3. Weekly vs monthly: is the board expected to reconcile with the drilldown in **both** modes, or only the
    currently-viewed mode?
+
+---
+
+## 12. Department-Wise Correctness Verification
+
+Confirmed: **there is exactly ONE scoring engine.** No `if (department === …)` / role / designation /
+business_unit branch inside `getScoreboardData` or `calculateMISScore` changes how D1/D2/FMS/PMS are
+counted. The `department` param is read once (`tasks.service.ts:7443`) and never used for counting again.
+Every department (Sales, DMS, Finance, project teams, …) runs the same math, so the fix behaves
+identically for all of them. The only per-user/flag special-casing shifts the **date window** or
+overrides **MECA** — never the D1/D2/FMS/PMS counting rule (Sangram/Krupa `:7585-7615`; Sales
+`week_aligned`/broadcast-month `:7458`, `:7603-7632`; Bullseye `:7730-7837`; external scoreboard `:7506-7558`).
+
+### Correctness table
+
+| Module | Coverage | Fix verdict |
+|---|---|---|
+| **D1** | All departments (one engine) | ✅ Correct — remove guard, count carryover; matches drilldown. |
+| **D2** | All departments | ✅ Correct — same as D1. |
+| **FMS (internal / non-Sales)** | All departments | ✅ Correct — same shape as D1/D2. |
+| **PMS** | All departments | ⚠️ Needs an **added** open-carryover bucket, NOT the guard edit (Caveat 2). |
+| **FMS (Sales only)** | External SmartCue API (`src/fms-scoreboard/*`) | ❌ Out of scope — black box, fix can't reach it (Caveat 3). |
+
+### Caveats that make the fix complete (all must be addressed)
+
+**Caveat 1 — Fix BOTH functions (6 guards).** The buggy shortcut is duplicated in `calculateMISScore`
+(D1 `:6778`, D2 `:6824`, FMS `:6919`) **and** `calculateWeekMISScore` (D1 `:6554`, D2 `:6605`, FMS `:6678`,
+used by the trend bars, `:6946`/`:6988`). Fix only the first and the headline changes while the trend bars
+keep the old values → new headline-vs-trend mismatch. **PMS has no guard in either function.**
+
+**Caveat 2 — PMS needs an addition, not the guard edit.** `calculateMISScore` PMS (`:6840-6886`) counts
+remaining PMS only when `end_date ∈ [startDate,endDate]` (`:6871`) — no open-carryover bucket — while the
+drilldown counts open PMS by `end_date { $lte: toDate }` (`:2118`). Overdue PMS carryover is dropped from
+the score but shown in the list. Fix = ADD an open-PMS carryover bucket (`end_date < startDate`, open
+statuses), plus in-period completion by `actual_end_date`, to mirror the drilldown (`:2103`, `:2118`, `:2122`).
+
+**Caveat 3 — Sales FMS is external and out of scope.** The Sales FMS chip pulls from an external
+"SmartCue" API via a thin axios proxy (`src/fms-scoreboard/fms-scoreboard.service.ts:50-135`), not
+`calculateMISScore`. The internal fix cannot change it. Two consequences: (a) Sales-FMS reconciliation is a
+separate problem; (b) a **pre-existing** inconsistency exists — the Sales FMS *chip* shows the external
+number, but the board **total** `d1+d2+pms+fms` (`:6925`) always uses the *internal* FMS. Flag to business;
+decide whether to reconcile the external source or accept divergence.
+
+**Caveat 4 — Window alignment for shifted users.** Sangram/Krupa are scored on the **previous week**
+(`:7610-7615`) and Sales `week_aligned` on a **broadcast month** (`getBroadcastMonthRange` `:6311`). The
+fix is safe for them (same engine, different window), but the drilldown must be queried with the **same
+shifted/broadcast `from_date`/`to_date`** or the numbers still won't reconcile.
+
+### Monthly vs weekly
+`calculateMISScore` runs **once** per request over the full period (`:7636`); monthly mode does **not** loop
+per week (only the cosmetic trend bars loop, via `calculateWeekMISScore`). So reconciliation with the
+drilldown is identical in shape for weekly and monthly — only the interval length differs — provided the
+chip sends the matching month window.
+
+### Module applicability
+All four modules are computed for **every** user unconditionally; `total = (d1+d2+pms+fms)` always divides
+by 4 even if a user has no PMS/FMS work (those components resolve to 0 via the guards). There is no backend
+per-department "only these modules" gating — any such filtering is frontend-only.
+
+### Verdict
+The fix is **uniformly correct for D1, D2, and internal FMS across every department** (one engine, no
+branching). It is **safe** for the shifted-window users (Caveat 4) as long as the drilldown uses their
+window. It is **incomplete** until: both functions are patched (Caveat 1), PMS gets its carryover bucket
+(Caveat 2), and Sales-FMS is decided separately (Caveat 3).
 
 ---
 
